@@ -67,7 +67,7 @@ class CronManager(ManagerBase):
         self._agent_id = agent_id
         self._scheduler = AsyncIOScheduler(timezone=timezone)
         self._executor = CronExecutor(
-            workspace=workspace,
+            runner=workspace,
             channel_manager=channel_manager,
         )
 

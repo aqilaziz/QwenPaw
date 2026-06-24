@@ -18,9 +18,80 @@ logger = logging.getLogger(__name__)
 
 
 class CronExecutor:
-    def __init__(self, *, workspace: Any, channel_manager: Any):
-        self._workspace = workspace
+    def __init__(self, *, runner: Any, channel_manager: Any):
+        self._runner = runner
         self._channel_manager = channel_manager
+
+    @staticmethod
+    def _run_session_id(
+        *,
+        job_id: str | None,
+        target_session_id: str | None,
+        run_id: str,
+    ) -> str:
+        """Return a fresh cron execution session id."""
+        base_session_id = (
+            f"{target_session_id}:cron:{job_id}"
+            if target_session_id
+            else f"cron:{job_id}"
+        )
+        return f"{base_session_id}:run:{run_id}"
+
+    async def _target_session_exists(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        channel: str,
+    ) -> bool | None:
+        """Return whether the target session is still an active chat."""
+        chat_manager = getattr(self._runner, "_chat_manager", None)
+        list_chats = getattr(chat_manager, "list_chats", None)
+        if not callable(list_chats):
+            return None
+
+        chats = await list_chats(user_id=user_id, channel=channel)
+        return any(chat.session_id == session_id for chat in chats)
+
+    async def _resolve_agent_session_id(
+        self,
+        *,
+        job: CronJobSpec,
+        target_session_id: str | None,
+        target_user_id: str,
+        target_channel: str,
+        run_id: str,
+    ) -> str:
+        """Resolve which session id a cron agent run should use."""
+        if not job.runtime.share_session:
+            return self._run_session_id(
+                job_id=job.id,
+                target_session_id=target_session_id,
+                run_id=run_id,
+            )
+
+        if not target_session_id:
+            return f"cron:{job.id}"
+
+        exists = await self._target_session_exists(
+            session_id=target_session_id,
+            user_id=target_user_id,
+            channel=target_channel,
+        )
+        if exists is False:
+            logger.info(
+                "cron agent: target session no longer exists; "
+                "using fresh run session job_id=%s session_id=%s",
+                job.id,
+                target_session_id[:40],
+            )
+            return self._run_session_id(
+                job_id=job.id,
+                target_session_id=target_session_id,
+                run_id=run_id,
+            )
+
+        return target_session_id
 
     # pylint: disable=too-many-statements
     async def execute(self, job: CronJobSpec) -> dict[str, Any]:
@@ -34,10 +105,6 @@ class CronExecutor:
         target_session_id = job.dispatch.target.session_id
         target_channel = job.dispatch.channel
         dispatch_meta: Dict[str, Any] = dict(job.dispatch.meta or {})
-        if job.task_type == "agent":
-            # Agent cron replies still print to the console channel, but
-            # should not raise frontend push bubbles (Inbox remains opt-in).
-            dispatch_meta["suppress_console_push"] = True
         logger.info(
             "cron execute: job_id=%s channel=%s task_type=%s "
             "target_user_id=%s target_session_id=%s",
@@ -92,38 +159,24 @@ class CronExecutor:
 
         req["channel"] = target_channel
         req["user_id"] = target_user_id or "cron"
-        raw_context = req.get("request_context")
-        request_context = (
-            dict(raw_context) if isinstance(raw_context, dict) else {}
+
+        run_id = str(uuid.uuid4())
+
+        req["session_id"] = await self._resolve_agent_session_id(
+            job=job,
+            target_session_id=target_session_id,
+            target_user_id=req["user_id"],
+            target_channel=target_channel,
+            run_id=run_id,
         )
-        request_context["source"] = "cron"
-        request_context["cron_job_id"] = job.id or ""
-        req["request_context"] = request_context
-
-        # Determine session_id based on share_session
-        share_session = job.runtime.share_session
-        if share_session:
-            req["session_id"] = target_session_id or f"cron:{job.id}"
-        else:
-            # Use job.id (not run_id) so all runs of this job accumulate in the
-            # same dedicated session, giving users a complete history.
-            req["session_id"] = (
-                f"{target_session_id}:cron:{job.id}"
-                if target_session_id
-                else f"cron:{job.id}"
-            )
-            req["session_source"] = "cron"
-
         delivery_error: str | None = None
         baseline_messages = await read_session_messages(
-            runner=self._workspace,
+            runner=self._runner,
             session_id=req["session_id"],
             user_id=req["user_id"],
             channel=target_channel,
         )
         baseline_count = len(baseline_messages)
-
-        run_id = str(uuid.uuid4())
         await create_trace(
             run_id,
             meta={
@@ -138,7 +191,7 @@ class CronExecutor:
 
         async def _run() -> None:
             nonlocal delivery_error
-            async for event in self._workspace.stream_query(req):
+            async for event in self._runner.stream_query(req):
                 try:
                     await self._channel_manager.send_event(
                         channel=target_channel,
@@ -165,7 +218,7 @@ class CronExecutor:
             )
             await append_trace_from_session_delta(
                 run_id=run_id,
-                runner=self._workspace,
+                runner=self._runner,
                 session_id=req["session_id"],
                 user_id=req["user_id"],
                 channel=target_channel,
@@ -186,7 +239,7 @@ class CronExecutor:
             )
             await append_trace_from_session_delta(
                 run_id=run_id,
-                runner=self._workspace,
+                runner=self._runner,
                 session_id=req["session_id"],
                 user_id=req["user_id"],
                 channel=target_channel,
@@ -202,7 +255,7 @@ class CronExecutor:
             logger.info("cron execute: job_id=%s cancelled", job.id)
             await append_trace_from_session_delta(
                 run_id=run_id,
-                runner=self._workspace,
+                runner=self._runner,
                 session_id=req["session_id"],
                 user_id=req["user_id"],
                 channel=target_channel,
@@ -217,7 +270,7 @@ class CronExecutor:
         except Exception as e:  # pylint: disable=broad-except
             await append_trace_from_session_delta(
                 run_id=run_id,
-                runner=self._workspace,
+                runner=self._runner,
                 session_id=req["session_id"],
                 user_id=req["user_id"],
                 channel=target_channel,
